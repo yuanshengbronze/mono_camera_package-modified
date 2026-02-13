@@ -6,6 +6,7 @@ from cv_bridge import CvBridge
 from marti_common_msgs.msg import Float32Stamped
 from geometry_msgs.msg import Vector3Stamped
 from collections import deque
+from geometry_msgs.msg import Vector3
 
 import cv2
 import numpy as np
@@ -69,6 +70,7 @@ class OpticalFlowNode(Node):
 
         # === PUBLISHERS ===
         self.speed_pub = self.create_publisher(Float32, '/optical_flow/speed', 10)
+        self.speed_comp_pub = self.create_publisher(Float32, '/optical_flow/speed_comp', 10)
         self.image_pub = self.create_publisher(Image, '/optical_flow/annotated_image', 10)
 
         # === OPTICAL FLOW STATE ===
@@ -281,6 +283,10 @@ class OpticalFlowNode(Node):
             speed_msg = Float32()
             speed_msg.data = float(avg_speed) # in m/s
             self.speed_pub.publish(speed_msg)
+
+            speed_comp_msg = Vector3()
+            speed_comp_msg.x, speed_comp_msg.y, speed_comp_msg.z = v_uav_x, v_uav_y, avg_speed
+            self.speed_comp_pub.publish(speed_comp_msg)
 
         # --- Update for next frame ---
         self.prev_gray = frame_gray.copy()
