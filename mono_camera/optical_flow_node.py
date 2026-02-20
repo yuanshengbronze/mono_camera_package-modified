@@ -14,9 +14,32 @@ import numpy as np
 class OpticalFlowNode(Node):
     def __init__(self):
         super().__init__('optical_flow_node')
+
+        # === PARAMETERS ===
+        # ros2 run mono_camera optical_flow_node --ros-args \
+        #   -p clahe.clip_limit:=3.0 -p clahe.tile_x:=8 -p clahe.tile_y:=8
+        
+        # Scene / geometry
+        self.declare_parameter('pool_depth', 2.0)
+
+        # Feature detection (GFTT)
+        self.declare_parameter('features.max', 350)
+        self.declare_parameter('features.quality', 0.03)
+        self.declare_parameter('features.min_distance', 12)
+        self.declare_parameter('features.redetect_interval', 50)
+
+        # LK optical flow
+        self.declare_parameter('lk.win_size', 25)   # int, used as (win, win)  
+        self.declare_parameter('lk.max_level', 2)
+
+        # CLAHE
+        self.declare_parameter('clahe.enable', True)
+        self.declare_parameter('clahe.clip_limit', 2.0)
+        self.declare_parameter('clahe.tile_x', 8)
+        self.declare_parameter('clahe.tile_y', 8)
         
         # === CONSTANTS ===
-        self.POOL_DEPTH = 2 # in m
+        self.POOL_DEPTH = float(self.get_parameter('pool_depth').value)
         self.FX = 522.94629
         self.FY = 525.422
         self.CX = 338.45741
@@ -34,15 +57,24 @@ class OpticalFlowNode(Node):
         self.yaw = None
         self.vz = 0.0
         self.w_yaw = 0.0
-
-        # === PARAMETERS ===
-        self.MAX_FEATURES = 350
-        self.QUALITY_LEVEL = 0.03
-        self.MIN_DISTANCE = 12
         self.DIRECTION_SMOOTH = 0.8
         self.ALPHA = 0.3
-        self.REDETECT_INTERVAL = 50
 
+        # === CLAHE AND FEATURE TRACKING VARIABLES === 
+        self.MAX_FEATURES = int(self.get_parameter('features.max').value)
+        self.QUALITY_LEVEL = float(self.get_parameter('features.quality').value)
+        self.MIN_DISTANCE = int(self.get_parameter('features.min_distance').value)
+        self.REDETECT_INTERVAL = int(self.get_parameter('features.redetect_interval').value)
+
+        self.CLAHE_ENABLE = bool(self.get_parameter('clahe.enable').value)
+        self.clip = float(self.get_parameter('clahe.clip_limit').value)
+        self.tx = int(self.get_parameter('clahe.tile_x').value)
+        self.ty = int(self.get_parameter('clahe.tile_y').value)
+        clip = max(0.1, self.clip)
+        tx = max(1, self.tx)
+        ty = max(1, self.ty)
+        self.clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tx, ty))
+ 
         # === OPENCV BRIDGE ===
         self.bridge = CvBridge()
 
@@ -70,7 +102,7 @@ class OpticalFlowNode(Node):
 
         # === PUBLISHERS ===
         self.speed_pub = self.create_publisher(Float32, '/optical_flow/speed', 10)
-        self.speed_comp_pub = self.create_publisher(Float32, '/optical_flow/speed_comp', 10)
+        self.speed_comp_pub = self.create_publisher(Vector3, '/optical_flow/speed_comp', 10)
         self.image_pub = self.create_publisher(Image, '/optical_flow/annotated_image', 10)
 
         # === OPTICAL FLOW STATE ===
@@ -82,8 +114,8 @@ class OpticalFlowNode(Node):
 
         # === LK PARAMETERS ===
         self.lk_params = dict(
-            winSize=(25, 25),
-            maxLevel=2,
+            winSize=(int(self.get_parameter('lk.win_size').value), int(self.get_parameter('lk.win_size').value)),
+            maxLevel=int(self.get_parameter('lk.max_level').value),
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03)
         )
 
@@ -174,6 +206,10 @@ class OpticalFlowNode(Node):
         # Convert ROS image to OpenCV
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        if(self.CLAHE_ENABLE):
+            # Pre-Processing with CLAHE
+            frame_gray = self.clahe.apply(frame_gray)
 
         # Initialize first frame
         if self.prev_gray is None:
@@ -266,7 +302,7 @@ class OpticalFlowNode(Node):
         # Use Least-Squares
         if len(stacked_metric_vel) > 0:
             V = np.array(stacked_metric_vel)  # N x 2 (vx, vy for each point)
-            w = np.diag(stacked_weights)  # N x N weight matrix
+            w = np.array(stacked_weights)  # weight matrix
             
             # Set up least-squares problem: V = A * [v_uav_x, v_uav_y]^T
             # Since all points should have the same UAV velocity, we solve:
