@@ -3,7 +3,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float32
 from cv_bridge import CvBridge
-from marti_common_msgs.msg import Float32Stamped
 from geometry_msgs.msg import Vector3Stamped
 from collections import deque
 from geometry_msgs.msg import Vector3
@@ -46,8 +45,9 @@ class OpticalFlowNode(Node):
         
         # === VARIABLES ===
         self.last_img_t = None
-        self.prev_depth_t = None
-        self.prev_depth_m = None
+        self.depth_m = None
+        self.depth_last_t = None   # local receipt time
+        self.vz = 0.0
         self.prev_yaw_t = None
         self.prev_yaw = None
         self.depth_m = None
@@ -86,7 +86,7 @@ class OpticalFlowNode(Node):
         )
 
         self.depth_sub = self.create_subscription(
-            Float32Stamped,
+            Float32,
             '/depth',
             self.depth_callback,
             10
@@ -127,9 +127,7 @@ class OpticalFlowNode(Node):
         )
 
         # === Time Buffers ===
-        self.depth_buffer = deque(maxlen=30)
         self.rpy_buffer = deque(maxlen=30)
-        self.MAX_DEPTH_SKEW = 0.08
         self.MAX_RPY_SKEW = 0.08
 
         self.get_logger().info("Optical Flow Node started.")
@@ -145,23 +143,22 @@ class OpticalFlowNode(Node):
             return None
         return best
         
-    def depth_callback(self, msg: Float32Stamped):
-        z = float(msg.value)
+    def depth_callback(self, msg: Float32):
+        z = float(msg.data)
+
         if z <= 0.0 or np.isnan(z) or np.isinf(z):
-           return
-        
-        t = self._stamp_to_sec(msg.header.stamp)
-        vz = 0.0 # Initialize vz
-        if self.prev_depth_t is not None:
-            dt = t - self.prev_depth_t
+            return
+
+        now = self.get_clock().now().nanoseconds * 1e-9
+
+        if self.depth_last_t is not None and self.depth_m is not None:
+            dt = now - self.depth_last_t
             if 1e-4 < dt < 1.0:
-                vz = (z - self.prev_depth_m) / dt
-        
-        self.prev_depth_t = t
-        self.prev_depth_m = z
-            
-        self.depth_buffer.append((t, z, vz))
-    
+                self.vz = (z - self.depth_m) / dt
+
+        self.depth_m = z
+        self.depth_last_t = now
+                
     def rpy_callback(self, msg: Vector3Stamped):
         r = float(msg.vector.x)
         p = float(msg.vector.y)
@@ -195,22 +192,21 @@ class OpticalFlowNode(Node):
             return
         
         # Get depth and rpy
-        depth_entry = self._nearest(self.depth_buffer, t, self.MAX_DEPTH_SKEW)
         rpy_entry = self._nearest(self.rpy_buffer, t, self.MAX_RPY_SKEW)
-        if depth_entry is None or rpy_entry is None:
+        if self.depth_m is None or rpy_entry is None:
             return
-        _, self.depth_m, vz = depth_entry
+        vz = float(self.vz)
         _, self.roll, self.pitch, self.yaw, w_yaw = rpy_entry
         
         # Convert ROS image to OpenCV
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
+        _, bright_mask = cv2.threshold(frame_gray, 220, 255, cv2.THRESH_BINARY)
+        bright_mask = cv2.bitwise_not(bright_mask)
         if(self.CLAHE_ENABLE):
             # Pre-Processing
             frame_gray = self.clahe.apply(frame_gray)
-            _, bright_mask = cv2.threshold(frame_gray, 220, 255, cv2.THRESH_BINARY)
-            bright_mask = cv2.bitwise_not(bright_mask)
+
 
         # Initialize first frame
         if self.prev_gray is None:
@@ -270,11 +266,11 @@ class OpticalFlowNode(Node):
             Y = ynorm * Z_m
 
             # AUV VELOCITY
-            vx = -dxnorm / dt * Z_m + xnorm * vz - w_yaw * Y
-            vy = -dynorm / dt * Z_m + ynorm * vz + w_yaw * X
+            vx = -dynorm / dt * Z_m + ynorm * vz #- w_yaw * X
+            vy = dxnorm / dt * Z_m - xnorm * vz #- w_yaw * Y
 
             mag = np.sqrt(vx**2 + vy**2)
-            if mag < 0.05:
+            if mag < 0.001:
                 continue
 
             # Smooth direction
@@ -322,7 +318,9 @@ class OpticalFlowNode(Node):
             self.speed_pub.publish(speed_msg)
 
             speed_comp_msg = Vector3()
-            speed_comp_msg.x, speed_comp_msg.y, speed_comp_msg.z = v_uav_x, v_uav_y, avg_speed
+            speed_comp_msg.x = v_uav_x if len(stacked_metric_vel) > 0 else 0.0
+            speed_comp_msg.y = v_uav_y if len(stacked_metric_vel) > 0 else 0.0
+            speed_comp_msg.z = avg_speed if len(stacked_metric_vel) > 0 else 0.0    
             self.speed_comp_pub.publish(speed_comp_msg)
 
         # --- Update for next frame ---
@@ -332,9 +330,9 @@ class OpticalFlowNode(Node):
 
         # --- Re-detect features if needed ---
         if self.frame_idx % self.REDETECT_INTERVAL == 0 or len(self.p0) < 30:
-            new_points = cv2.goodFeaturesToTrack(frame_gray, mask=None, **self.feature_params)
+            new_points = cv2.goodFeaturesToTrack(frame_gray, mask=bright_mask, **self.feature_params)
             if new_points is not None:
-                self.p0 = np.vstack((self.p0, new_points))
+                self.p0 = new_points
                 self.prev_dirs = np.zeros_like(self.p0)
 
 def main(args=None):
