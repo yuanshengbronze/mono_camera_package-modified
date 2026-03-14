@@ -43,6 +43,7 @@ class OpticalFlowNode(Node):
         # Yaw estimation
         self.declare_parameter('yaw.use_vision', True)           # use homography/curl vision yaw only
         self.declare_parameter('yaw.min_inliers', 8)             # minimum homography inliers
+        self.declare_parameter('yaw.rate_decay', 0.90)            # decay previous yaw rate if vision briefly drops
 
         # Velocity output
         self.declare_parameter('velocity.ema_alpha', 0.4)        # EMA smoothing for published velocity
@@ -99,6 +100,7 @@ class OpticalFlowNode(Node):
         # Yaw estimation params
         self.USE_VISION_YAW   = bool(self.get_parameter('yaw.use_vision').value)
         self.YAW_MIN_INLIERS  = int(self.get_parameter('yaw.min_inliers').value)
+        self.YAW_RATE_DECAY   = float(self.get_parameter('yaw.rate_decay').value)
  
         # === OPENCV BRIDGE ===
         self.bridge = CvBridge()
@@ -122,6 +124,7 @@ class OpticalFlowNode(Node):
         self.speed_pub = self.create_publisher(Float32, '/optical_flow/speed', 10)
         self.speed_comp_pub = self.create_publisher(Vector3, '/optical_flow/speed_comp', 10)
         self.image_pub = self.create_publisher(Image, '/optical_flow/annotated_image', 10)
+        self.yaw_pub = self.create_publisher(Float32, '/optical_flow/yaw', 10)
 
         # === OPTICAL FLOW STATE ===
         self.prev_gray = None
@@ -226,7 +229,7 @@ class OpticalFlowNode(Node):
             w_yaw_vision = self._estimate_yaw_rate_flow_curl(pts_old, pts_new, dt)
 
         if w_yaw_vision is None:
-            return 0.0
+            return None
 
         return float(w_yaw_vision)
 
@@ -338,16 +341,26 @@ class OpticalFlowNode(Node):
         valid_err = lk_err_flat[combined_mask]
 
         # =====================================================================
-        # YAW RATE  (vision only)
+        # YAW RATE  (vision only; keep yaw meaningful across short dropouts)
         # =====================================================================
+        w_yaw_est = None
         if self.USE_VISION_YAW and len(good_old) >= 4:
-            w_yaw = self._estimate_yaw_rate(good_old, good_new, dt)
+            w_yaw_est = self._estimate_yaw_rate(good_old, good_new, dt)
+
+        if w_yaw_est is not None:
+            w_yaw = w_yaw_est
         else:
-            w_yaw = 0.0
+            # Keep yaw significant even if a frame has poor geometry/inliers.
+            decay = np.clip(self.YAW_RATE_DECAY, 0.0, 1.0)
+            w_yaw = self.w_yaw * decay
 
         # Track a yaw state estimated from vision only.
         self.yaw = (self.yaw + (w_yaw * dt) + np.pi) % (2 * np.pi) - np.pi
         self.w_yaw = w_yaw
+
+        yaw_msg = Float32()
+        yaw_msg.data = float(self.yaw)
+        self.yaw_pub.publish(yaw_msg)
 
         # =====================================================================
         # PER-POINT VELOCITY COMPUTATION
