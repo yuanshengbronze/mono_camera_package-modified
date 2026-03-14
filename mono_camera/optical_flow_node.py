@@ -3,8 +3,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float32
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Vector3Stamped
-from collections import deque
 from geometry_msgs.msg import Vector3
 
 import cv2
@@ -43,8 +41,7 @@ class OpticalFlowNode(Node):
         self.declare_parameter('outlier.fb_threshold', 1.0)    # forward-backward error px
 
         # Yaw estimation
-        self.declare_parameter('yaw.use_vision', True)           # use homography-based yaw
-        self.declare_parameter('yaw.vision_alpha', 0.85)         # complementary filter weight for vision yaw
+        self.declare_parameter('yaw.use_vision', True)           # use homography/curl vision yaw only
         self.declare_parameter('yaw.min_inliers', 8)             # minimum homography inliers
 
         # Velocity output
@@ -64,12 +61,10 @@ class OpticalFlowNode(Node):
         self.last_img_t = None
         self.prev_depth_m = None
         self.depth_last_t = None   # local receipt time
-        self.prev_yaw_t = None
-        self.prev_yaw = None
         self.depth_m = None
-        self.roll = None
-        self.pitch = None
-        self.yaw = None
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
         self.vz = 0.0
         self.w_yaw = 0.0
         self.DIRECTION_SMOOTH = 0.8
@@ -103,7 +98,6 @@ class OpticalFlowNode(Node):
 
         # Yaw estimation params
         self.USE_VISION_YAW   = bool(self.get_parameter('yaw.use_vision').value)
-        self.YAW_VISION_ALPHA = float(self.get_parameter('yaw.vision_alpha').value)
         self.YAW_MIN_INLIERS  = int(self.get_parameter('yaw.min_inliers').value)
  
         # === OPENCV BRIDGE ===
@@ -121,13 +115,6 @@ class OpticalFlowNode(Node):
             Float32,
             '/depth',
             self.depth_callback,
-            10
-        )
-
-        self.rpy_sub = self.create_subscription(
-            Vector3Stamped,
-            '/rpy',
-            self.rpy_callback,
             10
         )
 
@@ -158,10 +145,6 @@ class OpticalFlowNode(Node):
             blockSize=7
         )
 
-        # === Time Buffers ===
-        self.rpy_buffer = deque(maxlen=30)
-        self.MAX_RPY_SKEW = 0.08
-
         self.get_logger().info("Optical Flow Node started.")
 
     # =========================================================================
@@ -171,14 +154,6 @@ class OpticalFlowNode(Node):
     def _stamp_to_sec(self, stamp):
         return stamp.sec + stamp.nanosec * 1e-9
     
-    def _nearest(self, buffer, t_ref, max_skew):
-        if not buffer:
-            return None
-        best = min(buffer, key=lambda x: abs(x[0] - t_ref))
-        if abs(best[0] - t_ref) > max_skew:
-            return None
-        return best
-
     def _bright_mask(self, gray):
         """Return a mask that excludes specular highlights (very bright pixels)."""
         _, bright = cv2.threshold(gray, self.BRIGHT_THRESHOLD, 255, cv2.THRESH_BINARY)
@@ -243,21 +218,17 @@ class OpticalFlowNode(Node):
         result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
         return float(result[0])
 
-    def _fuse_yaw_rate(self, w_yaw_imu, pts_old, pts_new, dt):
-        """
-        Attempt homography-based yaw estimation and fuse with IMU yaw rate
-        via a complementary filter.
-        """
+    def _estimate_yaw_rate(self, pts_old, pts_new, dt):
+        """Estimate yaw rate from vision only (homography with curl fallback)."""
         w_yaw_vision = self._estimate_yaw_rate_homography(pts_old, pts_new, dt)
 
         if w_yaw_vision is None and len(pts_old) >= 4:
             w_yaw_vision = self._estimate_yaw_rate_flow_curl(pts_old, pts_new, dt)
 
         if w_yaw_vision is None:
-            return w_yaw_imu
+            return 0.0
 
-        alpha = self.YAW_VISION_ALPHA
-        return alpha * w_yaw_vision + (1.0 - alpha) * w_yaw_imu
+        return float(w_yaw_vision)
 
     # =========================================================================
     # CALLBACKS
@@ -279,25 +250,6 @@ class OpticalFlowNode(Node):
         self.depth_m = z
         self.depth_last_t = now
     
-    def rpy_callback(self, msg: Vector3Stamped):
-        r = np.deg2rad(float(msg.vector.x))
-        p = np.deg2rad(float(msg.vector.y))
-        y = np.deg2rad(float(msg.vector.z))
-        t = self._stamp_to_sec(msg.header.stamp)
-
-        w_yaw = 0.0
-        if self.prev_yaw_t is not None:
-            dt = t - self.prev_yaw_t
-            if 1e-4 < dt < 1.0:
-                dyaw = (y - self.prev_yaw + np.pi) % (2 * np.pi) - np.pi
-                w_yaw = dyaw / dt
-        
-        self.prev_roll  = r
-        self.prev_pitch = p
-        self.prev_yaw   = y
-        self.prev_yaw_t = t
-        self.rpy_buffer.append((t, r, p, y, w_yaw))
-
     def image_callback(self, msg):
         # --- Timing ---
         t = self._stamp_to_sec(msg.header.stamp)
@@ -310,12 +262,13 @@ class OpticalFlowNode(Node):
         if dt <= 1e-4 or dt > 1.0:
             return
         
-        # --- Sync depth and RPY to image timestamp ---
-        rpy_entry   = self._nearest(self.rpy_buffer, t, self.MAX_RPY_SKEW)
-        if self.depth_m is None or rpy_entry is None:
+        # --- Sync depth to image timestamp ---
+        if self.depth_m is None:
             return
         vz = float(self.vz)
-        _, self.roll, self.pitch, self.yaw, w_yaw_imu = rpy_entry
+        # We intentionally ignore IMU attitude and assume roll/pitch are negligible.
+        self.roll = 0.0
+        self.pitch = 0.0
         
         # --- Convert to grayscale + optional CLAHE ---
         frame      = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -385,12 +338,16 @@ class OpticalFlowNode(Node):
         valid_err = lk_err_flat[combined_mask]
 
         # =====================================================================
-        # YAW RATE  (fused IMU + vision)
+        # YAW RATE  (vision only)
         # =====================================================================
         if self.USE_VISION_YAW and len(good_old) >= 4:
-            w_yaw = self._fuse_yaw_rate(w_yaw_imu, good_old, good_new, dt)
+            w_yaw = self._estimate_yaw_rate(good_old, good_new, dt)
         else:
-            w_yaw = w_yaw_imu
+            w_yaw = 0.0
+
+        # Track a yaw state estimated from vision only.
+        self.yaw = (self.yaw + (w_yaw * dt) + np.pi) % (2 * np.pi) - np.pi
+        self.w_yaw = w_yaw
 
         # =====================================================================
         # PER-POINT VELOCITY COMPUTATION
